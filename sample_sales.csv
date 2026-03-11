@@ -1,0 +1,4 @@
+order_id,customer,country,amount
+1,Alice,USA,100
+2,Bob,Canada,200
+3,John,USA,150
