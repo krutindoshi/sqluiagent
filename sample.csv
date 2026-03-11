@@ -1,0 +1,7 @@
+order_id,customer,country,category,amount,order_date
+1,Alice,USA,Electronics,120,2025-01-01
+2,Bob,Canada,Furniture,300,2025-01-02
+3,Carol,USA,Electronics,250,2025-01-03
+4,David,India,Books,80,2025-01-04
+5,Eve,Canada,Electronics,500,2025-01-05
+6,Frank,USA,Furniture,150,2025-01-06
