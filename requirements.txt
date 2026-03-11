@@ -1,0 +1,7 @@
+streamlit
+duckdb
+pandas
+matplotlib
+openpyxl
+requests
+openai
