@@ -23,7 +23,8 @@ st.markdown("""
     padding-bottom: 1rem;
 }
 div[data-testid="stMetric"] {
-    background: #f7f7f7;
+    background: rgba(255, 255, 255, 0.04);
+    border: 1px solid rgba(255, 255, 255, 0.08);
     padding: 10px 14px;
     border-radius: 10px;
 }
@@ -548,15 +549,13 @@ if st.session_state.page_mode == "Workspace":
         st.write("")
         generate_clicked = st.button("Generate SQL", use_container_width=True)
 
-    action1, action2, action3, action4 = st.columns([1, 1, 1, 1])
+    action1, action2, action3 = st.columns([1, 1, 1])
 
     with action1:
-        run_clicked = st.button("Run Query", use_container_width=True)
-    with action2:
         clear_history = st.button("Clear History", use_container_width=True)
-    with action3:
+    with action2:
         helper_preview = st.button("Top 10", use_container_width=True)
-    with action4:
+    with action3:
         helper_count = st.button("Count Rows", use_container_width=True)
 
     if clear_history:
@@ -645,6 +644,8 @@ if st.session_state.page_mode == "Workspace":
             height=260
         )
 
+        run_clicked = st.button("Run Query", use_container_width=True, key="run_query_near_sql")
+
         if st.session_state.generated_explanation:
             st.caption(st.session_state.generated_explanation)
 
@@ -679,13 +680,9 @@ if st.session_state.page_mode == "Workspace":
                 rows_count = len(st.session_state.last_result)
                 cols_count = len(st.session_state.last_result.columns)
 
-                m1, m2, m3 = st.columns(3)
-                with m1:
-                    st.metric("Rows Returned", rows_count)
-                with m2:
-                    st.metric("Columns Returned", cols_count)
-                with m3:
-                    st.metric("Active Table", st.session_state.active_table or "-")
+                st.caption(
+                    f"Rows Returned: {rows_count} | Columns Returned: {cols_count} | Active Table: {st.session_state.active_table or '-'}"
+                )
 
                 st.dataframe(st.session_state.last_result, use_container_width=True, height=380)
             else:
