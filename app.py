@@ -132,24 +132,110 @@ def add_history(sql_text):
     st.session_state.history = st.session_state.history[:20]
 
 
+def get_matching_column(columns, keywords):
+    for kw in keywords:
+        for col in columns:
+            if kw in col.lower():
+                return col
+    return None
+
+
 def fallback_nl_to_sql(question, tables):
     q = question.lower().strip()
-    first_table = st.session_state.active_table or (list(tables.keys())[0] if tables else None)
+    active_table = st.session_state.active_table or (list(tables.keys())[0] if tables else None)
 
-    if not first_table:
+    if not active_table:
         return "SELECT 1"
 
+    columns = tables[active_table]["columns"]
+
     if "top 10" in q or "sample" in q or "preview" in q:
-        return f"SELECT * FROM {first_table} LIMIT 10"
-    if "count" in q and "rows" in q:
-        return f"SELECT COUNT(*) AS row_count FROM {first_table}"
-    if "show data" in q:
-        return f"SELECT * FROM {first_table} LIMIT 100"
+        return f"SELECT * FROM {active_table} LIMIT 10"
+
+    if "show data" in q or "all rows" in q:
+        return f"SELECT * FROM {active_table} LIMIT 100"
+
+    if "count rows" in q or q == "count" or "number of rows" in q or "row count" in q:
+        return f"SELECT COUNT(*) AS row_count FROM {active_table}"
+
     if "distinct" in q:
-        cols = st.session_state.tables[first_table]["columns"]
-        if cols:
-            return f"SELECT DISTINCT {cols[0]} FROM {first_table} LIMIT 100"
-    return f"SELECT * FROM {first_table} LIMIT 10"
+        col = get_matching_column(columns, ["country", "category", "customer", "state", "city"])
+        if not col and columns:
+            col = columns[0]
+        return f"SELECT DISTINCT {col} FROM {active_table} LIMIT 100"
+
+    amount_col = get_matching_column(columns, ["amount", "sales", "revenue", "price", "cost", "spend"])
+    country_col = get_matching_column(columns, ["country"])
+    category_col = get_matching_column(columns, ["category", "segment", "type"])
+    customer_col = get_matching_column(columns, ["customer", "client", "name", "user"])
+    date_col = get_matching_column(columns, ["date", "order_date", "created", "timestamp"])
+
+    if ("total" in q or "sum" in q) and "country" in q and amount_col and country_col:
+        return f"""
+SELECT {country_col}, SUM({amount_col}) AS total_value
+FROM {active_table}
+GROUP BY {country_col}
+ORDER BY total_value DESC
+""".strip()
+
+    if ("total" in q or "sum" in q) and "category" in q and amount_col and category_col:
+        return f"""
+SELECT {category_col}, SUM({amount_col}) AS total_value
+FROM {active_table}
+GROUP BY {category_col}
+ORDER BY total_value DESC
+""".strip()
+
+    if ("total" in q or "sum" in q) and "customer" in q and amount_col and customer_col:
+        return f"""
+SELECT {customer_col}, SUM({amount_col}) AS total_value
+FROM {active_table}
+GROUP BY {customer_col}
+ORDER BY total_value DESC
+""".strip()
+
+    if ("average" in q or "avg" in q) and "country" in q and amount_col and country_col:
+        return f"""
+SELECT {country_col}, AVG({amount_col}) AS avg_value
+FROM {active_table}
+GROUP BY {country_col}
+ORDER BY avg_value DESC
+""".strip()
+
+    if ("average" in q or "avg" in q) and "category" in q and amount_col and category_col:
+        return f"""
+SELECT {category_col}, AVG({amount_col}) AS avg_value
+FROM {active_table}
+GROUP BY {category_col}
+ORDER BY avg_value DESC
+""".strip()
+
+    if ("highest" in q or "top customer" in q or "highest spend" in q or "most spend" in q) and amount_col and customer_col:
+        return f"""
+SELECT {customer_col}, SUM({amount_col}) AS total_value
+FROM {active_table}
+GROUP BY {customer_col}
+ORDER BY total_value DESC
+LIMIT 10
+""".strip()
+
+    if ("sales by month" in q or "revenue by month" in q or "amount by month" in q) and amount_col and date_col:
+        return f"""
+SELECT DATE_TRUNC('month', {date_col}) AS month, SUM({amount_col}) AS total_value
+FROM {active_table}
+GROUP BY month
+ORDER BY month
+""".strip()
+
+    if ("top 5" in q or "highest 5" in q) and amount_col:
+        return f"""
+SELECT *
+FROM {active_table}
+ORDER BY {amount_col} DESC
+LIMIT 5
+""".strip()
+
+    return f"SELECT * FROM {active_table} LIMIT 10"
 
 
 def generate_sql_openai(question, schema_text, api_key):
@@ -320,20 +406,36 @@ def set_sql_and_go(sql_text):
 with st.sidebar:
     st.header("Settings")
 
-    provider = st.selectbox(
+    provider_options = ["None", "OpenAI", "Ollama (Local Only)"]
+    current_provider = st.session_state.provider if st.session_state.provider in provider_options else "None"
+
+    st.session_state.provider = st.selectbox(
         "AI Provider",
-        ["None", "Ollama", "OpenAI"],
-        index=["None", "Ollama", "OpenAI"].index(st.session_state.provider)
+        provider_options,
+        index=provider_options.index(current_provider)
     )
-    st.session_state.provider = provider
 
-    ollama_model = ""
     openai_api_key = ""
+    ollama_model = "llama3.1"
 
-    if provider == "Ollama":
-    	st.info("Ollama works only when running locally on your machine.")        
-    elif provider == "OpenAI":
-    	st.info("Paste your own OpenAI API key. The app does not store it.")
+    if st.session_state.provider == "OpenAI":
+        openai_api_key = st.text_input(
+            "Enter OpenAI API Key",
+            type="password",
+            placeholder="sk-..."
+        )
+        st.caption("Your key is used only for this session.")
+
+    elif st.session_state.provider == "Ollama (Local Only)":
+        ollama_model = st.text_input(
+            "Ollama model",
+            value="llama3.1"
+        )
+        st.caption("Run Ollama locally first, for example: ollama run llama3.1")
+        st.warning("This option will not work on hosted Streamlit Cloud.")
+
+    else:
+        st.info("None mode supports basic prompts like top 10 rows, count rows, total sales by country, and average amount by category.")
 
     st.markdown("---")
     st.subheader("Upload Files")
@@ -505,17 +607,17 @@ if st.session_state.page_mode == "Workspace":
             schema_text = get_all_schema_text(st.session_state.conn, st.session_state.tables)
 
             try:
-                if provider == "OpenAI":
+                if st.session_state.provider == "OpenAI":
                     if not OPENAI_AVAILABLE:
                         st.error("OpenAI package not installed. Run: pip install openai")
                     elif not openai_api_key:
-                        st.error("Enter an OpenAI API key.")
+                        st.error("Enter an OpenAI API key in the left sidebar.")
                     else:
                         sql, explanation = generate_sql_openai(question, schema_text, openai_api_key)
                         st.session_state.generated_sql = sql
                         st.session_state.generated_explanation = explanation
 
-                elif provider == "Ollama":
+                elif st.session_state.provider == "Ollama (Local Only)":
                     try:
                         sql, explanation = generate_sql_ollama(question, schema_text, ollama_model)
                         st.session_state.generated_sql = sql
@@ -619,14 +721,14 @@ if st.session_state.page_mode == "Workspace":
         with tabs[2]:
             result_df = st.session_state.last_result
             if result_df is not None and not result_df.empty:
-                if provider == "OpenAI" and openai_api_key and OPENAI_AVAILABLE:
+                if st.session_state.provider == "OpenAI" and openai_api_key and OPENAI_AVAILABLE:
                     if st.button("Generate AI Summary", use_container_width=True):
                         try:
                             summary = summarize_result_openai(question, result_df, openai_api_key)
                             st.write(summary)
                         except Exception as e:
                             st.error(f"Summary failed: {e}")
-                elif provider == "Ollama":
+                elif st.session_state.provider == "Ollama (Local Only)":
                     if st.button("Generate AI Summary", use_container_width=True):
                         try:
                             summary = summarize_result_ollama(question, result_df, ollama_model)
@@ -636,7 +738,7 @@ if st.session_state.page_mode == "Workspace":
                 else:
                     st.write(f"- Returned {len(result_df)} rows")
                     st.write(f"- Columns: {', '.join(result_df.columns)}")
-                    st.write("- Enable Ollama or OpenAI for an AI-generated summary.")
+                    st.write("- Enable OpenAI or local Ollama for an AI-generated summary.")
             else:
                 st.info("Run a query first.")
 
