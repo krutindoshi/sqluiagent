@@ -1,11 +1,14 @@
 import os
 import re
 import json
+import time
 import requests
 import duckdb
 import pandas as pd
 import streamlit as st
 import matplotlib.pyplot as plt
+
+from typing import Dict, List, Optional, Tuple
 
 OPENAI_AVAILABLE = False
 try:
@@ -14,7 +17,14 @@ try:
 except Exception:
     OPENAI_AVAILABLE = False
 
-st.set_page_config(page_title="Data Workspace", layout="wide")
+ACE_AVAILABLE = False
+try:
+    from streamlit_ace import st_ace
+    ACE_AVAILABLE = True
+except Exception:
+    ACE_AVAILABLE = False
+
+st.set_page_config(page_title="SQLUIAgent", layout="wide")
 
 st.markdown("""
 <style>
@@ -22,54 +32,41 @@ st.markdown("""
     padding-top: 1rem;
     padding-bottom: 1rem;
 }
-div[data-testid="stMetric"] {
-    background: rgba(255, 255, 255, 0.04);
-    border: 1px solid rgba(255, 255, 255, 0.08);
-    padding: 10px 14px;
-    border-radius: 10px;
-}
 div.stButton > button {
     border-radius: 8px;
+}
+.small-note {
+    color: #9aa0a6;
+    font-size: 0.9rem;
 }
 </style>
 """, unsafe_allow_html=True)
 
-st.title("Data Workspace")
-st.caption("Upload CSV/Excel files, explore tables, write SQL, or use AI to generate queries.")
+st.title("SQLUIAgent")
+st.caption("Upload CSV/Excel files, explore tables, write SQL, or generate queries from plain English.")
 
 # --------------------------------------------------
 # Session state
 # --------------------------------------------------
-if "conn" not in st.session_state:
-    st.session_state.conn = duckdb.connect()
-
-if "tables" not in st.session_state:
-    st.session_state.tables = {}
-
-if "history" not in st.session_state:
-    st.session_state.history = []
-
-if "last_result" not in st.session_state:
-    st.session_state.last_result = None
-
-if "generated_sql" not in st.session_state:
-    st.session_state.generated_sql = ""
-
-if "generated_explanation" not in st.session_state:
-    st.session_state.generated_explanation = ""
-
-if "explorer_table" not in st.session_state:
-    st.session_state.explorer_table = None
-
-if "page_mode" not in st.session_state:
-    st.session_state.page_mode = "Workspace"
-
-if "active_table" not in st.session_state:
-    st.session_state.active_table = None
-
-if "provider" not in st.session_state:
-    st.session_state.provider = "None"
-
+defaults = {
+    "conn": duckdb.connect(),
+    "tables": {},
+    "history": [],
+    "last_result": None,
+    "generated_sql": "",
+    "generated_explanation": "",
+    "explorer_table": None,
+    "page_mode": "Workspace",
+    "active_table": None,
+    "provider": "None",
+    "last_runtime_sec": None,
+    "last_rows_returned": None,
+    "last_chart_suggestion": None,
+    "last_summary_text": "",
+}
+for k, v in defaults.items():
+    if k not in st.session_state:
+        st.session_state[k] = v
 
 # --------------------------------------------------
 # Helpers
@@ -80,7 +77,6 @@ def sanitize_table_name(name: str) -> str:
     if re.match(r"^\d", base):
         base = f"t_{base}"
     return base
-
 
 def load_file_to_duckdb(uploaded_file, conn):
     filename = uploaded_file.name
@@ -98,23 +94,18 @@ def load_file_to_duckdb(uploaded_file, conn):
     conn.unregister(f"{table_name}_tmp")
     return table_name, df
 
-
-def get_schema_info(conn, table_name):
+def get_schema_info(conn, table_name: str) -> pd.DataFrame:
     return conn.execute(f"DESCRIBE {table_name}").fetchdf()
 
+def list_columns(conn, table_name: str) -> List[str]:
+    return get_schema_info(conn, table_name)["column_name"].tolist()
 
-def list_columns(conn, table_name):
-    schema_df = get_schema_info(conn, table_name)
-    return schema_df["column_name"].tolist()
-
-
-def get_all_schema_text(conn, tables):
+def get_all_schema_text(conn, tables: Dict) -> str:
     parts = []
     for table_name in tables:
         schema_df = get_schema_info(conn, table_name)
         parts.append(f"Table: {table_name}\n{schema_df.to_string(index=False)}\n")
     return "\n".join(parts)
-
 
 def is_safe_sql(sql: str) -> bool:
     banned = [
@@ -127,21 +118,144 @@ def is_safe_sql(sql: str) -> bool:
         return False
     return not any(word in sql_upper for word in banned)
 
-
-def add_history(sql_text):
+def add_history(sql_text: str):
     st.session_state.history.insert(0, sql_text)
     st.session_state.history = st.session_state.history[:20]
 
-
-def get_matching_column(columns, keywords):
+def get_matching_column(columns: List[str], keywords: List[str]) -> Optional[str]:
     for kw in keywords:
         for col in columns:
             if kw in col.lower():
                 return col
     return None
 
+def profile_table(conn, table_name: str) -> pd.DataFrame:
+    df = conn.execute(f"SELECT * FROM {table_name}").fetchdf()
+    rows = len(df)
+    profile_rows = []
 
-def fallback_nl_to_sql(question, tables):
+    for col in df.columns:
+        series = df[col]
+        null_count = int(series.isna().sum())
+        null_pct = round((null_count / rows * 100), 2) if rows else 0
+        distinct_count = int(series.nunique(dropna=True))
+        dtype = str(series.dtype)
+
+        min_val = ""
+        max_val = ""
+        sample = ""
+
+        non_null = series.dropna()
+        if not non_null.empty:
+            sample = str(non_null.iloc[0])[:50]
+            if pd.api.types.is_numeric_dtype(series) or pd.api.types.is_datetime64_any_dtype(series):
+                try:
+                    min_val = str(non_null.min())
+                    max_val = str(non_null.max())
+                except Exception:
+                    pass
+
+        profile_rows.append({
+            "column": col,
+            "dtype": dtype,
+            "null_count": null_count,
+            "null_pct": null_pct,
+            "distinct_count": distinct_count,
+            "min": min_val,
+            "max": max_val,
+            "sample": sample
+        })
+
+    return pd.DataFrame(profile_rows)
+
+def suggest_chart(result_df: pd.DataFrame) -> Optional[Dict]:
+    if result_df is None or result_df.empty or len(result_df.columns) < 2:
+        return None
+
+    numeric_cols = result_df.select_dtypes(include="number").columns.tolist()
+    non_numeric_cols = [c for c in result_df.columns if c not in numeric_cols]
+
+    if numeric_cols and non_numeric_cols:
+        return {
+            "chart_type": "Bar",
+            "x": non_numeric_cols[0],
+            "y": numeric_cols[0],
+            "reason": f"{numeric_cols[0]} looks numeric and {non_numeric_cols[0]} looks categorical."
+        }
+
+    if len(numeric_cols) >= 2:
+        return {
+            "chart_type": "Scatter",
+            "x": numeric_cols[0],
+            "y": numeric_cols[1],
+            "reason": "Two numeric columns detected."
+        }
+
+    if len(numeric_cols) == 1 and any("date" in c.lower() or "month" in c.lower() for c in result_df.columns):
+        date_col = next(c for c in result_df.columns if "date" in c.lower() or "month" in c.lower())
+        return {
+            "chart_type": "Line",
+            "x": date_col,
+            "y": numeric_cols[0],
+            "reason": "Time-like column and numeric measure detected."
+        }
+
+    return None
+
+def build_basic_summary(result_df: pd.DataFrame) -> str:
+    if result_df is None or result_df.empty:
+        return "No rows returned."
+
+    lines = [
+        f"- Returned {len(result_df)} rows",
+        f"- Columns: {', '.join(result_df.columns)}"
+    ]
+
+    numeric_cols = result_df.select_dtypes(include="number").columns.tolist()
+    if numeric_cols:
+        top_col = numeric_cols[0]
+        try:
+            lines.append(f"- {top_col} ranges from {result_df[top_col].min()} to {result_df[top_col].max()}")
+        except Exception:
+            pass
+
+    return "\n".join(lines)
+
+def generate_auto_insights(result_df: pd.DataFrame) -> List[str]:
+    if result_df is None or result_df.empty:
+        return ["No insights available because the result is empty."]
+
+    insights = []
+    numeric_cols = result_df.select_dtypes(include="number").columns.tolist()
+
+    if numeric_cols:
+        num_col = numeric_cols[0]
+        try:
+            max_idx = result_df[num_col].idxmax()
+            min_idx = result_df[num_col].idxmin()
+
+            if len(result_df.columns) > 1:
+                label_cols = [c for c in result_df.columns if c != num_col]
+                label_col = label_cols[0] if label_cols else None
+
+                if label_col:
+                    insights.append(f"Highest {num_col}: {result_df.loc[max_idx, label_col]} with {result_df.loc[max_idx, num_col]}")
+                    insights.append(f"Lowest {num_col}: {result_df.loc[min_idx, label_col]} with {result_df.loc[min_idx, num_col]}")
+            else:
+                insights.append(f"Highest {num_col}: {result_df[num_col].max()}")
+                insights.append(f"Lowest {num_col}: {result_df[num_col].min()}")
+        except Exception:
+            pass
+
+    if len(result_df) > 10:
+        insights.append("Result has more than 10 rows; consider filtering or aggregating for easier analysis.")
+
+    if not insights:
+        insights.append("Query ran successfully and returned structured results.")
+
+    return insights[:3]
+
+def fallback_nl_to_sql(question: str, tables: Dict) -> str:
     q = question.lower().strip()
     active_table = st.session_state.active_table or (list(tables.keys())[0] if tables else None)
 
@@ -187,22 +301,6 @@ GROUP BY {category_col}
 ORDER BY total_value DESC
 """.strip()
 
-    if ("total" in q or "sum" in q) and "customer" in q and amount_col and customer_col:
-        return f"""
-SELECT {customer_col}, SUM({amount_col}) AS total_value
-FROM {active_table}
-GROUP BY {customer_col}
-ORDER BY total_value DESC
-""".strip()
-
-    if ("average" in q or "avg" in q) and "country" in q and amount_col and country_col:
-        return f"""
-SELECT {country_col}, AVG({amount_col}) AS avg_value
-FROM {active_table}
-GROUP BY {country_col}
-ORDER BY avg_value DESC
-""".strip()
-
     if ("average" in q or "avg" in q) and "category" in q and amount_col and category_col:
         return f"""
 SELECT {category_col}, AVG({amount_col}) AS avg_value
@@ -211,7 +309,7 @@ GROUP BY {category_col}
 ORDER BY avg_value DESC
 """.strip()
 
-    if ("highest" in q or "top customer" in q or "highest spend" in q or "most spend" in q) and amount_col and customer_col:
+    if ("highest" in q or "top customer" in q or "highest spend" in q) and amount_col and customer_col:
         return f"""
 SELECT {customer_col}, SUM({amount_col}) AS total_value
 FROM {active_table}
@@ -228,18 +326,9 @@ GROUP BY month
 ORDER BY month
 """.strip()
 
-    if ("top 5" in q or "highest 5" in q) and amount_col:
-        return f"""
-SELECT *
-FROM {active_table}
-ORDER BY {amount_col} DESC
-LIMIT 5
-""".strip()
-
     return f"SELECT * FROM {active_table} LIMIT 10"
 
-
-def generate_sql_openai(question, schema_text, api_key):
+def generate_sql_openai(question: str, schema_text: str, api_key: str) -> Tuple[str, str]:
     client = OpenAI(api_key=api_key)
 
     prompt = f"""
@@ -264,7 +353,6 @@ Schema:
 User question:
 {question}
 """
-
     response = client.responses.create(
         model="gpt-5.4",
         input=prompt
@@ -273,8 +361,7 @@ User question:
     data = json.loads(raw)
     return data["sql"], data.get("explanation", "")
 
-
-def generate_sql_ollama(question, schema_text, model_name):
+def generate_sql_ollama(question: str, schema_text: str, model_name: str) -> Tuple[str, str]:
     prompt = f"""
 You are a data analyst that writes DuckDB SQL.
 
@@ -297,7 +384,6 @@ Schema:
 User question:
 {question}
 """
-
     response = requests.post(
         "http://localhost:11434/api/generate",
         json={
@@ -312,8 +398,7 @@ User question:
     data = json.loads(raw)
     return data["sql"], data.get("explanation", "")
 
-
-def summarize_result_openai(question, result_df, api_key):
+def summarize_result_openai(question: str, result_df: pd.DataFrame, api_key: str) -> str:
     client = OpenAI(api_key=api_key)
     prompt = f"""
 You are a business data analyst.
@@ -332,8 +417,7 @@ Give a concise 3 bullet summary.
     )
     return response.output_text.strip()
 
-
-def summarize_result_ollama(question, result_df, model_name):
+def summarize_result_ollama(question: str, result_df: pd.DataFrame, model_name: str) -> str:
     prompt = f"""
 You are a business data analyst.
 
@@ -357,8 +441,7 @@ Give a concise 3 bullet summary.
     response.raise_for_status()
     return response.json()["response"].strip()
 
-
-def draw_chart(df, x_col, y_col, chart_type):
+def draw_chart(df: pd.DataFrame, x_col: str, y_col: str, chart_type: str):
     fig, ax = plt.subplots(figsize=(8, 4))
 
     if chart_type == "Bar":
@@ -376,10 +459,11 @@ def draw_chart(df, x_col, y_col, chart_type):
     st.pyplot(fig)
     plt.close(fig)
 
-
-def suggest_joins(tables_meta):
+def suggest_joins(tables_meta: Dict) -> List[Tuple[str, str, str]]:
     suggestions = []
     table_names = list(tables_meta.keys())
+
+    strong_keys = ["id", "customer_id", "order_id", "product_id", "user_id", "account_id", "date"]
 
     for i in range(len(table_names)):
         for j in range(i + 1, len(table_names)):
@@ -388,18 +472,26 @@ def suggest_joins(tables_meta):
             cols1 = set(tables_meta[t1]["columns"])
             cols2 = set(tables_meta[t2]["columns"])
             shared = cols1.intersection(cols2)
-            likely = [c for c in shared if c.endswith("_id") or c in ["id", "date"]]
 
-            for col in likely[:3]:
+            ranked = sorted(
+                list(shared),
+                key=lambda c: (0 if c.lower() in strong_keys else 1, c)
+            )
+
+            for col in ranked[:3]:
                 suggestions.append((t1, t2, col))
 
     return suggestions
 
-
-def set_sql_and_go(sql_text):
+def set_sql_and_go(sql_text: str):
     st.session_state.generated_sql = sql_text
     st.session_state.page_mode = "Workspace"
 
+def append_token_to_sql(token: str):
+    current = st.session_state.generated_sql or ""
+    if current and not current.endswith((" ", "\n", "\t", ",")):
+        current += " "
+    st.session_state.generated_sql = current + token
 
 # --------------------------------------------------
 # Sidebar
@@ -428,10 +520,7 @@ with st.sidebar:
         st.caption("Your key is used only for this session.")
 
     elif st.session_state.provider == "Ollama (Local Only)":
-        ollama_model = st.text_input(
-            "Ollama model",
-            value="llama3.1"
-        )
+        ollama_model = st.text_input("Ollama model", value="llama3.1")
         st.caption("Run Ollama locally first, for example: ollama run llama3.1")
         st.warning("This option will not work on hosted Streamlit Cloud.")
 
@@ -455,7 +544,6 @@ with st.sidebar:
                     "rows": len(df),
                     "columns": list(df.columns)
                 }
-
                 if st.session_state.explorer_table is None:
                     st.session_state.explorer_table = table_name
                 if st.session_state.active_table is None:
@@ -494,7 +582,6 @@ with st.sidebar:
     else:
         st.caption("No query history yet.")
 
-
 # --------------------------------------------------
 # Top nav
 # --------------------------------------------------
@@ -514,10 +601,9 @@ with nav2:
     if st.session_state.page_mode == "Workspace":
         st.caption("Query your data with SQL or English prompts.")
     elif st.session_state.page_mode == "Explorer":
-        st.caption("Inspect schema and preview table data.")
+        st.caption("Inspect schema, preview data, and profile columns.")
     else:
         st.caption("Review likely join relationships across uploaded tables.")
-
 
 # --------------------------------------------------
 # Workspace
@@ -574,7 +660,7 @@ if st.session_state.page_mode == "Workspace":
     with helper_cols[1]:
         helper_nulls = st.button("Null Check", use_container_width=True)
     with helper_cols[2]:
-        helper_schema = st.button("Preview Schema", use_container_width=True)
+        helper_schema = st.button("Profile Table", use_container_width=True)
     with helper_cols[3]:
         helper_reset = st.button("Reset SQL", use_container_width=True)
 
@@ -604,7 +690,6 @@ if st.session_state.page_mode == "Workspace":
             st.error("Upload at least one file first.")
         else:
             schema_text = get_all_schema_text(st.session_state.conn, st.session_state.tables)
-
             try:
                 if st.session_state.provider == "OpenAI":
                     if not OPENAI_AVAILABLE:
@@ -623,26 +708,47 @@ if st.session_state.page_mode == "Workspace":
                         st.session_state.generated_explanation = explanation
                     except Exception as e:
                         st.error(f"Ollama request failed: {e}")
-
                 else:
                     st.session_state.generated_sql = fallback_nl_to_sql(question, st.session_state.tables)
                     st.session_state.generated_explanation = "Generated using built-in fallback logic."
-
             except Exception as e:
                 st.error(f"Failed to generate SQL: {e}")
 
     if not st.session_state.generated_sql and st.session_state.active_table:
         st.session_state.generated_sql = f"SELECT * FROM {st.session_state.active_table} LIMIT 10"
 
-    left, right = st.columns([1.05, 1.35])
+    left, right = st.columns([1.1, 1.4])
 
     with left:
         st.subheader("SQL Worksheet")
-        sql_text = st.text_area(
-            "Edit SQL",
-            value=st.session_state.generated_sql,
-            height=260
-        )
+
+        if st.session_state.active_table in st.session_state.tables:
+            available_cols = st.session_state.tables[st.session_state.active_table]["columns"][:12]
+            st.caption("Quick insert columns")
+            chip_cols = st.columns(4)
+            for idx, col_name in enumerate(available_cols):
+                with chip_cols[idx % 4]:
+                    if st.button(col_name, key=f"chip_{col_name}", use_container_width=True):
+                        append_token_to_sql(col_name)
+                        st.rerun()
+
+        if ACE_AVAILABLE:
+            sql_text = st_ace(
+                value=st.session_state.generated_sql,
+                language="sql",
+                theme="tomorrow_night",
+                height=280,
+                key="ace_sql_editor",
+                auto_update=True
+            )
+            if sql_text is not None:
+                st.session_state.generated_sql = sql_text
+        else:
+            sql_text = st.text_area(
+                "Edit SQL",
+                value=st.session_state.generated_sql,
+                height=260
+            )
 
         run_clicked = st.button("Run Query", use_container_width=True, key="run_query_near_sql")
 
@@ -664,26 +770,33 @@ if st.session_state.page_mode == "Workspace":
                 st.error("Only read-only SELECT/WITH queries are allowed.")
             else:
                 try:
+                    start = time.time()
                     result_df = st.session_state.conn.execute(sql_text).fetchdf()
+                    end = time.time()
+
                     st.session_state.last_result = result_df
                     st.session_state.generated_sql = sql_text
+                    st.session_state.last_runtime_sec = round(end - start, 4)
+                    st.session_state.last_rows_returned = len(result_df)
+                    st.session_state.last_chart_suggestion = suggest_chart(result_df)
+                    st.session_state.last_summary_text = build_basic_summary(result_df)
                     add_history(sql_text)
                     st.success("Query executed successfully.")
                 except Exception as e:
                     st.error(f"Query failed: {e}")
 
         st.subheader("Results")
-        tabs = st.tabs(["Data", "Chart", "Summary", "Download"])
+        tabs = st.tabs(["Data", "Chart", "Summary", "Profile", "Download"])
 
         with tabs[0]:
             if st.session_state.last_result is not None:
                 rows_count = len(st.session_state.last_result)
                 cols_count = len(st.session_state.last_result.columns)
+                runtime = st.session_state.last_runtime_sec if st.session_state.last_runtime_sec is not None else "-"
 
                 st.caption(
-                    f"Rows Returned: {rows_count} | Columns Returned: {cols_count} | Active Table: {st.session_state.active_table or '-'}"
+                    f"Rows Returned: {rows_count} | Columns Returned: {cols_count} | Active Table: {st.session_state.active_table or '-'} | Runtime: {runtime}s"
                 )
-
                 st.dataframe(st.session_state.last_result, use_container_width=True, height=380)
             else:
                 st.info("Run a query to see results here.")
@@ -691,22 +804,32 @@ if st.session_state.page_mode == "Workspace":
         with tabs[1]:
             result_df = st.session_state.last_result
             if result_df is not None and not result_df.empty and len(result_df.columns) >= 2:
+                suggestion = st.session_state.last_chart_suggestion
+                if suggestion:
+                    st.caption(
+                        f"Suggested chart: {suggestion['chart_type']} | X: {suggestion['x']} | Y: {suggestion['y']} | Reason: {suggestion['reason']}"
+                    )
+
                 numeric_cols = result_df.select_dtypes(include="number").columns.tolist()
                 all_cols = result_df.columns.tolist()
 
                 if numeric_cols:
+                    default_x = suggestion["x"] if suggestion and suggestion["x"] in all_cols else all_cols[0]
+                    default_y = suggestion["y"] if suggestion and suggestion["y"] in all_cols else numeric_cols[0]
+                    default_chart = suggestion["chart_type"] if suggestion else "Bar"
+
                     c1, c2, c3 = st.columns(3)
                     with c1:
-                        x_col = st.selectbox("X-axis", all_cols, index=0, key="chart_x")
+                        x_col = st.selectbox("X-axis", all_cols, index=all_cols.index(default_x), key="chart_x")
                     with c2:
-                        y_col = st.selectbox(
-                            "Y-axis",
-                            all_cols,
-                            index=all_cols.index(numeric_cols[0]),
-                            key="chart_y"
-                        )
+                        y_col = st.selectbox("Y-axis", all_cols, index=all_cols.index(default_y), key="chart_y")
                     with c3:
-                        chart_type = st.selectbox("Chart", ["Bar", "Line", "Scatter"], key="chart_type")
+                        chart_type = st.selectbox(
+                            "Chart",
+                            ["Bar", "Line", "Scatter"],
+                            index=["Bar", "Line", "Scatter"].index(default_chart if default_chart in ["Bar", "Line", "Scatter"] else "Bar"),
+                            key="chart_type"
+                        )
 
                     if st.button("Draw Chart", use_container_width=True):
                         draw_chart(result_df, x_col, y_col, chart_type)
@@ -718,6 +841,11 @@ if st.session_state.page_mode == "Workspace":
         with tabs[2]:
             result_df = st.session_state.last_result
             if result_df is not None and not result_df.empty:
+                st.write("**Quick Insights**")
+                for insight in generate_auto_insights(result_df):
+                    st.write(f"- {insight}")
+
+                st.write("**Summary**")
                 if st.session_state.provider == "OpenAI" and openai_api_key and OPENAI_AVAILABLE:
                     if st.button("Generate AI Summary", use_container_width=True):
                         try:
@@ -725,6 +853,8 @@ if st.session_state.page_mode == "Workspace":
                             st.write(summary)
                         except Exception as e:
                             st.error(f"Summary failed: {e}")
+                    else:
+                        st.write(st.session_state.last_summary_text)
                 elif st.session_state.provider == "Ollama (Local Only)":
                     if st.button("Generate AI Summary", use_container_width=True):
                         try:
@@ -732,14 +862,24 @@ if st.session_state.page_mode == "Workspace":
                             st.write(summary)
                         except Exception as e:
                             st.error(f"Summary failed: {e}")
+                    else:
+                        st.write(st.session_state.last_summary_text)
                 else:
-                    st.write(f"- Returned {len(result_df)} rows")
-                    st.write(f"- Columns: {', '.join(result_df.columns)}")
-                    st.write("- Enable OpenAI or local Ollama for an AI-generated summary.")
+                    st.write(st.session_state.last_summary_text)
             else:
                 st.info("Run a query first.")
 
         with tabs[3]:
+            if st.session_state.active_table:
+                try:
+                    profile_df = profile_table(st.session_state.conn, st.session_state.active_table)
+                    st.dataframe(profile_df, use_container_width=True, height=380)
+                except Exception as e:
+                    st.error(f"Profile generation failed: {e}")
+            else:
+                st.info("Choose a table first.")
+
+        with tabs[4]:
             result_df = st.session_state.last_result
             if result_df is not None:
                 csv_data = result_df.to_csv(index=False).encode("utf-8")
@@ -753,7 +893,6 @@ if st.session_state.page_mode == "Workspace":
             else:
                 st.info("Run a query first to download results.")
 
-
 # --------------------------------------------------
 # Explorer
 # --------------------------------------------------
@@ -764,15 +903,15 @@ elif st.session_state.page_mode == "Explorer":
         current_table = st.session_state.explorer_table
         current_meta = st.session_state.tables[current_table]
 
-        m1, m2, m3 = st.columns(3)
-        with m1:
+        c1, c2, c3 = st.columns(3)
+        with c1:
             st.metric("Table", current_table)
-        with m2:
+        with c2:
             st.metric("Rows", current_meta["rows"])
-        with m3:
+        with c3:
             st.metric("Columns", len(current_meta["columns"]))
 
-        explorer_tabs = st.tabs(["Schema", "Data Preview", "Columns"])
+        explorer_tabs = st.tabs(["Schema", "Data Preview", "Columns", "Profile"])
 
         with explorer_tabs[0]:
             schema_df = get_schema_info(st.session_state.conn, current_table)
@@ -792,9 +931,15 @@ elif st.session_state.page_mode == "Explorer":
                 st.session_state.generated_sql = f"SELECT * FROM {current_table} LIMIT 10"
                 st.session_state.page_mode = "Workspace"
                 st.rerun()
+
+        with explorer_tabs[3]:
+            try:
+                profile_df = profile_table(st.session_state.conn, current_table)
+                st.dataframe(profile_df, use_container_width=True, height=430)
+            except Exception as e:
+                st.error(f"Profile generation failed: {e}")
     else:
         st.info("Load a file and click Explore in the left sidebar.")
-
 
 # --------------------------------------------------
 # Joins
@@ -823,4 +968,4 @@ LIMIT 100
                 st.session_state.page_mode = "Workspace"
                 st.rerun()
     else:
-        st.info("No likely joins found yet. Upload more files with shared keys like customer_id, order_id, or id.")
+        st.info("No likely joins found yet. Upload more files with shared keys like customer_id, order_id, product_id, or id.")
